@@ -1,6 +1,6 @@
 # Fork Customizations
 
-> This repository is a fork of [unknown]().
+> This repository is a fork of [stanfordnlp/dspy](https://github.com/stanfordnlp/dspy).
 > Managed under the [iAiFy Enterprise](https://github.com/enterprises/iAiFy) governance model.
 
 ## Purpose
@@ -11,7 +11,7 @@ DSPy: The framework for programming—not prompting—language models
 
 | Property | Value |
 |----------|-------|
-| Upstream | [unknown]() |
+| Upstream | [stanfordnlp/dspy](https://github.com/stanfordnlp/dspy) |
 | Language | Python |
 | Fork org | AiFeatures |
 
