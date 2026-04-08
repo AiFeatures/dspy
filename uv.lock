@@ -958,7 +958,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
     { name = "tenacity", specifier = ">=8.2.3" },
     { name = "tqdm", specifier = ">=4.66.1" },
-    { name = "typeguard", specifier = ">=4.4.3" },
+    { name = "typeguard", specifier = "==4.4.3" },
     { name = "weaviate-client", marker = "extra == 'weaviate'", specifier = "~=4.5.4" },
     { name = "xxhash", specifier = ">=3.5.0" },
 ]
