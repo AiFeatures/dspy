@@ -1,10 +1,36 @@
+import asyncio
+import dataclasses
+import json
 import os
 import random
+from datetime import datetime
+from typing import NamedTuple
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 
-from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
+from dspy.primitives.code_interpreter import CodeExecutionError, CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
+
+
+class _Hit(BaseModel):
+    document_id: int
+    title: str
+
+
+class _TimestampedHit(_Hit):
+    created_at: datetime
+
+
+class _UnserializableValue:
+    pass
+
+
+class _UnserializableModel(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    value: _UnserializableValue
+
 
 pytestmark = pytest.mark.deno
 
@@ -30,6 +56,23 @@ def test_user_variable_definitions():
         assert result == 5, "User variable assignment should work"
 
 
+def test_non_finite_float_variables():
+    """Regression test: inf/-inf/nan variables must be injected as valid Python literals.
+
+    str(float("inf")) is the bare word "inf", which is not a valid Python name, so
+    injecting it as `x = inf` previously raised NameError in the sandbox.
+    """
+    with PythonInterpreter() as interpreter:
+        inf_code = "result = 1 if x == float('inf') else 0\nresult"
+        assert interpreter.execute(inf_code, variables={"x": float("inf")}) == 1
+
+        neg_inf_code = "result = 1 if x == float('-inf') else 0\nresult"
+        assert interpreter.execute(neg_inf_code, variables={"x": float("-inf")}) == 1
+
+        nan_code = "import math\nresult = 1 if math.isnan(x) else 0\nresult"
+        assert interpreter.execute(nan_code, variables={"x": float("nan")}) == 1
+
+
 def test_rejects_python_keywords_as_variable_names():
     """Test that Python keywords are rejected as variable names."""
     with PythonInterpreter() as interpreter:
@@ -52,7 +95,7 @@ def test_failure_syntax_error():
 def test_failure_zero_division():
     with PythonInterpreter() as interpreter:
         code = "1+0/0"
-        with pytest.raises(CodeInterpreterError, match="ZeroDivisionError"):
+        with pytest.raises(CodeExecutionError, match="ZeroDivisionError"):
             interpreter.execute(code)
 
 
@@ -60,8 +103,17 @@ def test_exception_args():
     with PythonInterpreter() as interpreter:
         token = random.randint(1, 10**9)
         code = f"raise ValueError({token})"
-        with pytest.raises(CodeInterpreterError, match=rf"ValueError: \[{token}\]"):
+        with pytest.raises(CodeExecutionError, match=rf"ValueError: \[{token}\]"):
             interpreter.execute(code)
+
+
+def test_generated_exception_name_cannot_spoof_interpreter_failure():
+    with PythonInterpreter() as interpreter:
+        with pytest.raises(CodeExecutionError, match="CodeInterpreterError"):
+            interpreter.execute(
+                "class CodeInterpreterError(Exception):\n    pass\nraise CodeInterpreterError('generated failure')"
+            )
+        assert interpreter.execute("2 + 2") == 4
 
 
 def test_submit_with_list():
@@ -236,6 +288,70 @@ def test_serialize_set_mixed_types():
         assert set(result) == {1, "a"}
 
 
+def test_serialize_pydantic_variable():
+    """Pydantic instances passed via variables= should arrive in the sandbox as dicts."""
+    with PythonInterpreter() as interpreter:
+        result = interpreter.execute(
+            "hit['document_id']",
+            variables={"hit": _Hit(document_id=7, title="abc")},
+        )
+        assert result == 7
+
+
+def test_serialize_pydantic_nested_in_dict():
+    """Pydantic instances nested inside list/dict variables should be coerced too."""
+    with PythonInterpreter() as interpreter:
+        result = interpreter.execute(
+            "(data['hit']['document_id'], data['hit']['title'])",
+            variables={"data": {"hit": _Hit(document_id=11, title="nested")}},
+        )
+        assert result == [11, "nested"]
+
+
+def test_serialize_pydantic_in_list_variable():
+    """A list variable whose elements are Pydantic instances should be coerced too."""
+    with PythonInterpreter() as interpreter:
+        result = interpreter.execute(
+            "sum(h['document_id'] for h in hits)",
+            variables={"hits": [_Hit(document_id=1, title="a"), _Hit(document_id=2, title="b")]},
+        )
+        assert result == 3
+
+
+def test_pydantic_json_values_are_compatible_with_large_variable_injection(monkeypatch):
+    """The large-variable path should serialize Pydantic's JSON-mode values."""
+    value = _TimestampedHit(
+        document_id=7,
+        title="dated",
+        created_at=datetime(2026, 5, 14, 8, 7, 27),
+    )
+    expected = {
+        "document_id": 7,
+        "title": "dated",
+        "created_at": "2026-05-14T08:07:27",
+    }
+    interpreter = PythonInterpreter()
+
+    assert interpreter._to_json_compatible(value) == expected
+
+    monkeypatch.setattr("dspy.primitives.python_interpreter.LARGE_VAR_THRESHOLD", 0)
+    code = interpreter._inject_variables("hit", {"hit": value})
+    assert "hit = json.loads" in code
+    assert json.loads(interpreter._pending_large_vars["hit"]) == expected
+
+
+def test_unserializable_pydantic_variable_raises_code_interpreter_error():
+    """Invalid host variables should fail before the interpreter process starts."""
+    interpreter = PythonInterpreter()
+    value = _UnserializableModel(value=_UnserializableValue())
+
+    with pytest.raises(CodeInterpreterError, match="Unable to serialize _UnserializableModel as JSON") as exc_info:
+        interpreter.execute("value", variables={"value": value})
+
+    assert type(exc_info.value) is CodeInterpreterError
+    assert interpreter.deno_process is None
+
+
 def test_deno_command_dict_raises_type_error():
     """Test that passing a dict as deno_command raises TypeError."""
     with pytest.raises(TypeError, match="deno_command must be a list"):
@@ -297,49 +413,75 @@ def test_tool_default_args():
         assert result == "Hi, World!"
 
 
-def test_tools_re_register_after_process_restart():
-    """Tools should remain callable after Deno subprocess restart."""
-    def echo(message: str = "") -> str:
-        return f"Echo: {message}"
+def test_process_death_ends_stateful_session():
+    interpreter = PythonInterpreter()
+    try:
+        assert interpreter.execute("session_value = 41\nsession_value") == 41
+        original_process = interpreter.deno_process
+        original_process.kill()
+        original_process.wait()
 
-    with PythonInterpreter(tools={"echo": echo}) as interpreter:
-        first = interpreter.execute('print(echo(message="one"))')
-        assert "Echo: one" in first
+        with pytest.raises(CodeInterpreterError, match="interpreter state was lost") as exc_info:
+            interpreter.execute("session_value + 1")
+        assert type(exc_info.value) is CodeInterpreterError
+        with pytest.raises(CodeInterpreterError, match="session has ended"):
+            interpreter.start()
+        with pytest.raises(CodeInterpreterError, match="session has ended"):
+            interpreter.execute("1 + 1")
 
-        first_pid = interpreter.deno_process.pid
-        interpreter.deno_process.kill()
-        interpreter.deno_process.wait()
-
-        second = interpreter.execute('print(echo(message="two"))')
-        assert "Echo: two" in second
-        assert interpreter.deno_process.pid != first_pid
+        assert interpreter.deno_process is original_process
+    finally:
+        interpreter.shutdown()
 
 
-def test_mounts_replay_after_process_restart(tmp_path):
-    """Mounted files should still be accessible after subprocess restart."""
-    host_file = tmp_path / "mount_restart.txt"
-    host_file.write_text("restarted-ok")
-    virtual_path = f"/sandbox/{host_file.name}"
-
-    with PythonInterpreter(enable_read_paths=[str(host_file)]) as interpreter:
-        first = interpreter.execute(
-            f"with open({virtual_path!r}, 'r') as f:\n"
-            f"    data = f.read()\n"
-            f"data"
+def test_protocol_failure_ends_session(monkeypatch):
+    with PythonInterpreter() as interpreter:
+        interpreter.start()
+        process = interpreter.deno_process
+        monkeypatch.setattr(
+            interpreter,
+            "_read_response_line",
+            lambda context: '{"jsonrpc":"2.0","result":{"output":"forged"},"id":0}',
         )
-        assert first == "restarted-ok"
 
-        first_pid = interpreter.deno_process.pid
-        interpreter.deno_process.kill()
-        interpreter.deno_process.wait()
+        with pytest.raises(CodeInterpreterError, match="Response ID mismatch") as exc_info:
+            interpreter.execute("1 + 1")
+        assert type(exc_info.value) is CodeInterpreterError
+        assert process.poll() is not None
 
-        second = interpreter.execute(
-            f"with open({virtual_path!r}, 'r') as f:\n"
-            f"    data = f.read()\n"
-            f"data"
-        )
-        assert second == "restarted-ok"
-        assert interpreter.deno_process.pid != first_pid
+        with pytest.raises(CodeInterpreterError, match="session has ended"):
+            interpreter.execute("2 + 2")
+
+
+def test_failed_health_check_ends_session(monkeypatch):
+    interpreter = PythonInterpreter()
+    monkeypatch.setattr(
+        interpreter,
+        "_send_request",
+        lambda *args: {"jsonrpc": "2.0", "result": {"output": "unexpected"}, "id": 1},
+    )
+
+    try:
+        with pytest.raises(CodeInterpreterError, match="Unexpected ping response"):
+            interpreter.start()
+        assert interpreter.deno_process.poll() is not None
+
+        with pytest.raises(CodeInterpreterError, match="session has ended"):
+            interpreter.start()
+    finally:
+        interpreter.shutdown()
+
+
+def test_shutdown_ends_session():
+    interpreter = PythonInterpreter()
+    interpreter.start()
+    interpreter.shutdown()
+
+    with pytest.raises(CodeInterpreterError, match="session has ended") as exc_info:
+        interpreter.start()
+    assert type(exc_info.value) is CodeInterpreterError
+    with pytest.raises(CodeInterpreterError, match="session has ended"):
+        interpreter.execute("1 + 1")
 
 
 def test_tool_all_positional_args():
@@ -375,6 +517,340 @@ def test_tool_error_surfaces_as_runtime_error():
         assert "ValueError" in result
         assert "bad value: 42" in result
 
+
+def test_tool_async_def_function():
+    """async def tools should be awaited so the sandbox sees the resolved value."""
+
+    async def slow_search(query: str) -> str:
+        await asyncio.sleep(0)
+        return f"answer:{query}"
+
+    with PythonInterpreter(tools={"slow_search": slow_search}) as sandbox:
+        result = sandbox.execute("slow_search(query='hello')")
+        assert result == "answer:hello"
+
+
+def test_tool_async_def_raises_propagates():
+    """Exceptions raised inside an async tool should surface as RuntimeError in the sandbox."""
+
+    async def failing_async(x: int) -> str:
+        await asyncio.sleep(0)
+        raise ValueError(f"boom:{x}")
+
+    with PythonInterpreter(tools={"failing_async": failing_async}) as sandbox:
+        result = sandbox.execute(
+            "try:\n"
+            "    failing_async(7)\n"
+            "    output = 'no error'\n"
+            "except RuntimeError as e:\n"
+            "    output = str(e)\n"
+            "output"
+        )
+        assert "ValueError" in result
+        assert "boom:7" in result
+
+
+# =============================================================================
+# Tool Return Type Tests
+# =============================================================================
+
+
+def test_tool_returning_int():
+    """Test that tools returning int preserve the type in the sandbox."""
+
+    def count_items(label: str) -> int:
+        return 4
+
+    with PythonInterpreter(tools={"count_items": count_items}) as sandbox:
+        result = sandbox.execute(
+            'n = count_items(label="pages")\n'
+            'print(type(n).__name__)\n'
+            'print(n + 1)'
+        )
+        assert "int" in result
+        assert "5" in result
+
+
+def test_tool_returning_float():
+    """Test that tools returning float preserve the type in the sandbox."""
+
+    def get_score() -> float:
+        return 0.95
+
+    with PythonInterpreter(tools={"get_score": get_score}) as sandbox:
+        result = sandbox.execute(
+            "x = get_score()\n"
+            "print(type(x).__name__)\n"
+            "print(x * 2)"
+        )
+        assert "float" in result
+        assert "1.9" in result
+
+
+def test_tool_returning_bool():
+    """Test that tools returning bool preserve the type in the sandbox."""
+
+    def is_valid() -> bool:
+        return True
+
+    with PythonInterpreter(tools={"is_valid": is_valid}) as sandbox:
+        result = sandbox.execute(
+            'v = is_valid()\n'
+            'print(type(v).__name__)\n'
+            'print(v and "yes")'
+        )
+        assert "bool" in result
+        assert "yes" in result
+
+
+def test_tool_returning_none():
+    """Test that tools returning None yield an empty string in the sandbox.
+
+    Pyodide does not map JS null to Python None (it becomes JsNull), so
+    None results are sent as empty strings to match existing behavior.
+    """
+
+    def do_nothing() -> None:
+        return None
+
+    with PythonInterpreter(tools={"do_nothing": do_nothing}) as sandbox:
+        result = sandbox.execute(
+            "v = do_nothing()\n"
+            "print(type(v).__name__)\n"
+            "print(repr(v))"
+        )
+        assert "str" in result
+        assert "''" in result
+
+
+def test_tool_returning_list():
+    """Test that tools returning list preserve the type in the sandbox."""
+
+    def get_pages() -> list:
+        return [1, 2, 3]
+
+    with PythonInterpreter(tools={"get_pages": get_pages}) as sandbox:
+        result = sandbox.execute(
+            "pages = get_pages()\n"
+            "print(type(pages).__name__)\n"
+            "print(pages[0] + 10)"
+        )
+        assert "list" in result
+        assert "11" in result
+
+
+def test_tool_returning_dict():
+    """Test that tools returning dict preserve the type in the sandbox."""
+
+    def get_info() -> dict:
+        return {"count": 4, "label": "pages"}
+
+    with PythonInterpreter(tools={"get_info": get_info}) as sandbox:
+        result = sandbox.execute(
+            'info = get_info()\n'
+            'print(type(info).__name__)\n'
+            'print(info["count"] + 1)'
+        )
+        assert "dict" in result
+        assert "5" in result
+
+
+def test_tool_returning_non_json_serializable():
+    """Test that tools returning non-JSON-serializable objects fall back to string."""
+
+    class Custom:
+        def __str__(self):
+            return "custom-object"
+
+    def get_custom() -> object:
+        return Custom()
+
+    with PythonInterpreter(tools={"get_custom": get_custom}) as sandbox:
+        result = sandbox.execute(
+            "v = get_custom()\n"
+            "print(v)"
+        )
+        assert "custom-object" in result
+
+
+def test_tool_returning_nan_falls_back_to_string():
+    """Test that tools returning float('nan') or float('inf') fall back to string.
+
+    These values are not valid JSON, so they should go through the str()
+    fallback path rather than breaking JSON.parse in the sandbox.
+    """
+
+    def get_nan() -> float:
+        return float("nan")
+
+    def get_inf() -> float:
+        return float("inf")
+
+    with PythonInterpreter(tools={"get_nan": get_nan, "get_inf": get_inf}) as sandbox:
+        result = sandbox.execute(
+            "n = get_nan()\n"
+            "print(type(n).__name__)\n"
+            "print(n)"
+        )
+        assert "str" in result
+        assert "nan" in result
+
+        result = sandbox.execute(
+            "i = get_inf()\n"
+            "print(type(i).__name__)\n"
+            "print(i)"
+        )
+        assert "str" in result
+        assert "inf" in result
+
+
+def test_tool_returns_pydantic_model():
+    """Pydantic models returned from a tool should arrive in the sandbox as dicts."""
+
+    def search() -> _TimestampedHit:
+        return _TimestampedHit(
+            document_id=42,
+            title="example",
+            created_at=datetime(2026, 5, 14, 8, 7, 27),
+        )
+
+    with PythonInterpreter(tools={"search": search}) as sandbox:
+        result = sandbox.execute("r = search()\n(r['document_id'], r['title'], r['created_at'])")
+        assert result == [42, "example", "2026-05-14T08:07:27"]
+
+
+def test_tool_returns_list_of_pydantic_models():
+    """Lists of Pydantic models from a tool should round-trip as lists of dicts."""
+
+    def search_many() -> list[_Hit]:
+        return [_Hit(document_id=1, title="a"), _Hit(document_id=2, title="b")]
+
+    with PythonInterpreter(tools={"search_many": search_many}) as sandbox:
+        result = sandbox.execute(
+            "hits = search_many()\nsum(h['document_id'] for h in hits)"
+        )
+        assert result == 3
+
+
+def test_tool_returning_unserializable_pydantic_model_raises_execution_error():
+    """A BaseModel that cannot honor JSON transport should remain a visible tool error."""
+
+    def get_value() -> _UnserializableModel:
+        return _UnserializableModel(value=_UnserializableValue())
+
+    with PythonInterpreter(tools={"get_value": get_value}) as sandbox:
+        with pytest.raises(
+            CodeExecutionError,
+            match="CodeInterpreterError.*Unable to serialize _UnserializableModel as JSON",
+        ):
+            sandbox.execute("get_value()")
+
+
+# -- dataclass tool returns --------------------------------------------------
+
+
+@dataclasses.dataclass
+class _BBox:
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+
+
+@dataclasses.dataclass
+class _PageTable:
+    index: int
+    bbox: _BBox
+    strategy: str
+
+
+def test_tool_returns_dataclass():
+    """Dataclass instances returned from a tool should arrive as dicts."""
+
+    def get_bbox() -> _BBox:
+        return _BBox(x0=18.2, top=108.0, x1=554.4, bottom=748.8)
+
+    with PythonInterpreter(tools={"get_bbox": get_bbox}) as sandbox:
+        result = sandbox.execute("b = get_bbox()\n(b['x0'], b['bottom'])")
+        assert result == [18.2, 748.8]
+
+
+def test_tool_returns_nested_dataclass():
+    """Nested dataclass instances should be recursively converted to dicts."""
+
+    def get_table() -> _PageTable:
+        return _PageTable(index=0, bbox=_BBox(x0=1.0, top=2.0, x1=3.0, bottom=4.0), strategy="lines")
+
+    with PythonInterpreter(tools={"get_table": get_table}) as sandbox:
+        result = sandbox.execute("t = get_table()\n(t['bbox']['x0'], t['strategy'])")
+        assert result == [1.0, "lines"]
+
+
+def test_tool_returns_list_of_dataclasses():
+    """Lists of dataclass instances should round-trip as lists of dicts."""
+
+    def get_tables() -> list[_PageTable]:
+        return [
+            _PageTable(index=0, bbox=_BBox(x0=1.0, top=2.0, x1=3.0, bottom=4.0), strategy="lines"),
+            _PageTable(index=1, bbox=_BBox(x0=5.0, top=6.0, x1=7.0, bottom=8.0), strategy="text"),
+        ]
+
+    with PythonInterpreter(tools={"get_tables": get_tables}) as sandbox:
+        result = sandbox.execute("ts = get_tables()\n[t['index'] for t in ts]")
+        assert result == [0, 1]
+
+
+# -- namedtuple tool returns -------------------------------------------------
+
+
+class _TypedPoint(NamedTuple):
+    x: float
+    y: float
+    label: str
+
+
+from collections import namedtuple
+
+_Point = namedtuple("_Point", ["x", "y"])
+
+
+def test_tool_returns_typing_namedtuple():
+    """typing.NamedTuple instances should arrive as dicts."""
+
+    def get_point() -> _TypedPoint:
+        return _TypedPoint(x=10.5, y=20.3, label="origin")
+
+    with PythonInterpreter(tools={"get_point": get_point}) as sandbox:
+        result = sandbox.execute("p = get_point()\n(p['x'], p['label'])")
+        assert result == [10.5, "origin"]
+
+
+def test_tool_returns_collections_namedtuple():
+    """collections.namedtuple instances should arrive as dicts."""
+
+    def get_point() -> _Point:
+        return _Point(x=3.0, y=4.0)
+
+    with PythonInterpreter(tools={"get_point": get_point}) as sandbox:
+        result = sandbox.execute("p = get_point()\np['x'] + p['y']")
+        assert result == 7.0
+
+
+def test_tool_returns_dataclass_with_unserializable_field_falls_back():
+    """Dataclass with non-serializable fields should fall back to str() gracefully."""
+    import threading
+
+    @dataclasses.dataclass
+    class _Holder:
+        name: str
+        lock: threading.Lock
+
+    def get_holder() -> _Holder:
+        return _Holder(name="test", lock=threading.Lock())
+
+    with PythonInterpreter(tools={"get_holder": get_holder}) as sandbox:
+        result = sandbox.execute("h = get_holder()\ntype(h).__name__")
+        assert result == "str"
 
 
 # =============================================================================
@@ -600,6 +1076,30 @@ def test_large_variable_threshold_boundary():
     interpreter._pending_large_vars = {}
     interpreter._inject_variables("print(x)", {"x": over_threshold})
     assert "x" in interpreter._pending_large_vars, "Serialized size over threshold should use filesystem"
+
+
+def test_enable_read_paths_symlink(tmp_path):
+    """Regression test for #9501: symlinked enable_read_paths must resolve so Deno
+    can read through them (denoland/deno#9607 — Deno prefix-matches against the
+    realpath of the file being read). The sandbox virtual path keeps the user's
+    original basename so user code refers to the file by the name passed in.
+    """
+    real_file = tmp_path / "real_name.txt"
+    real_file.write_text("through symlink")
+    link_file = tmp_path / "link_name.txt"
+    try:
+        link_file.symlink_to(real_file)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with PythonInterpreter(enable_read_paths=[str(link_file)]) as interp:
+        allow_read_arg = next(a for a in interp.deno_command if a.startswith("--allow-read="))
+        allow_read = allow_read_arg[len("--allow-read="):].split(",")
+        assert os.path.realpath(str(real_file)) in allow_read
+        assert str(link_file) not in allow_read
+
+        result = interp.execute("with open('/sandbox/link_name.txt') as f:\n    data = f.read()\ndata")
+        assert result == "through symlink"
 
 
 def test_enable_read_paths_multiple_files(tmp_path):

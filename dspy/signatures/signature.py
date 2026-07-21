@@ -173,6 +173,14 @@ class SignatureMeta(type(BaseModel)):
         ordered_annotations.update({k: v for k, v in raw_annotations.items() if k not in ordered_annotations})
         namespace["__annotations__"] = ordered_annotations
 
+        # On Python 3.14+, prevent Pydantic from capturing this frame's locals via
+        # parent_frame_namespace(). Those locals include references to the __annotate__
+        # closure and the class namespace dict, which contain unpicklable _abc._abc_data
+        # and break cloudpickle. This is safe because DSPy eagerly resolves all
+        # annotations above.
+        if sys.version_info >= (3, 14):
+            kwargs["__pydantic_reset_parent_namespace__"] = False
+
         # Let Pydantic do its thing
         cls = super().__new__(mcs, signature_name, bases, namespace, **kwargs)
 
@@ -294,6 +302,35 @@ class Signature(BaseModel, metaclass=SignatureMeta):
             ```
         """
         return Signature(cls.fields, instructions)
+
+    @classmethod
+    def append_instructions(cls, instructions: str) -> type["Signature"]:
+        """Return a new Signature class with identical fields and `instructions` appended to the existing instructions.
+
+        This method does not mutate `cls`. It constructs a fresh Signature 
+        using the existing instructions from `cls.instructions` followed 
+        by `instructions`, joined by a blank line. 
+        Unlike `with_instructions`, the existing instructions are preserved rather than replaced.
+
+        Args:
+            instructions (str): Instruction text to append to the existing instructions.
+
+        Returns:
+            A new Signature class whose fields match `cls.fields` and whose instructions
+            equal the existing instructions joined to `instructions` by a blank line.
+
+        Examples:
+            ```python
+            import dspy
+
+            MySig = dspy.Signature("input_text -> output_text", "Translate to French.")
+            NewSig = MySig.append_instructions("Pass additional context.")
+            assert NewSig is not MySig
+            assert "Translate to French." in NewSig.instructions
+            assert "Pass additional context." in NewSig.instructions
+            ```
+        """
+        return Signature(cls.fields, f"{cls.instructions}\n\n{instructions}")
 
     @classmethod
     def with_updated_fields(cls, name: str, type_: type | None = None, **kwargs: dict[str, Any]) -> type["Signature"]:
