@@ -1,5 +1,6 @@
 import inspect
 import logging
+import math
 import random
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Protocol, Union
@@ -62,11 +63,11 @@ class DspyGEPAResult:
     Additional data related to the GEPA run.
 
     Fields:
-    - candidates: list of proposed candidates (component_name -> component_text)
+    - candidates: list of proposed candidates (compiled DSPy modules)
     - parents: lineage info; for each candidate i, parents[i] is a list of parent indices or None
     - val_aggregate_scores: per-candidate aggregate score on the validation set (higher is better)
-    - val_subscores: per-candidate per-instance scores on the validation set (len == num_val_instances)
-    - per_val_instance_best_candidates: for each val instance t, a set of candidate indices achieving the best score on t
+    - val_subscores: per-candidate scores keyed by validation instance id
+    - per_val_instance_best_candidates: for each val instance id, a set of candidate indices achieving the best score
     - discovery_eval_counts: Budget (number of metric calls / rollouts) consumed up to the discovery of each candidate
 
     - total_metric_calls: total number of metric calls made across the run
@@ -75,19 +76,19 @@ class DspyGEPAResult:
     - seed: RNG seed for reproducibility (if known)
 
     - best_idx: candidate index with the highest val_aggregate_scores
-    - best_candidate: the program text mapping for best_idx
+    - best_candidate: the compiled DSPy module for best_idx
     """
 
     # Data about the proposed candidates
     candidates: list[Module]
     parents: list[list[int | None]]
     val_aggregate_scores: list[float]
-    val_subscores: list[list[float]]
-    per_val_instance_best_candidates: list[set[int]]
+    val_subscores: list[dict[Any, float]]
+    per_val_instance_best_candidates: dict[Any, set[int]]
     discovery_eval_counts: list[int]
 
     # Optional data
-    best_outputs_valset: list[list[tuple[int, list[Prediction]]]] | None = None
+    best_outputs_valset: dict[Any, list[tuple[int, Prediction]]] | None = None
 
     # Optimization metadata
     total_metric_calls: int | None = None
@@ -101,18 +102,21 @@ class DspyGEPAResult:
         return max(range(len(scores)), key=lambda i: scores[i])
 
     @property
-    def best_candidate(self) -> dict[str, str]:
+    def best_candidate(self) -> Module:
         return self.candidates[self.best_idx]
 
     @property
-    def highest_score_achieved_per_val_task(self) -> list[float]:
-        return [
-            self.val_subscores[list(self.per_val_instance_best_candidates[val_idx])[0]][val_idx]
-            for val_idx in range(len(self.val_subscores[0]))
-        ]
+    def highest_score_achieved_per_val_task(self) -> dict[Any, float]:
+        return {
+            val_id: self.val_subscores[list(self.per_val_instance_best_candidates[val_id])[0]][val_id]
+            for val_id in self.per_val_instance_best_candidates
+        }
 
     def to_dict(self) -> dict[str, Any]:
-        cands = [{k: v for k, v in cand.items()} for cand in self.candidates]
+        cands = [
+            {name: pred.signature.instructions for name, pred in cand.named_predictors()}
+            for cand in self.candidates
+        ]
 
         return dict(
             candidates=cands,
@@ -120,7 +124,9 @@ class DspyGEPAResult:
             val_aggregate_scores=self.val_aggregate_scores,
             best_outputs_valset=self.best_outputs_valset,
             val_subscores=self.val_subscores,
-            per_val_instance_best_candidates=[list(s) for s in self.per_val_instance_best_candidates],
+            per_val_instance_best_candidates={
+                val_id: list(s) for val_id, s in self.per_val_instance_best_candidates.items()
+            },
             discovery_eval_counts=self.discovery_eval_counts,
             total_metric_calls=self.total_metric_calls,
             num_full_val_evals=self.num_full_val_evals,
@@ -428,12 +434,17 @@ class GEPA(Teleprompter):
         self.component_selector = component_selector
         self.gepa_kwargs = gepa_kwargs or {}
 
+        if "reflection_prompt_template" in self.gepa_kwargs:
+            raise ValueError(
+                "reflection_prompt_template cannot be passed via gepa_kwargs when using dspy.GEPA. "
+                "DspyAdapter implements its own propose_new_texts, so reflection_prompt_template is unused. "
+                "To customize reflection behavior, pass a custom ProposalFn via the instruction_proposer parameter instead."
+            )
+
     def auto_budget(
         self, num_preds, num_candidates, valset_size: int, minibatch_size: int = 35, full_eval_steps: int = 5
     ) -> int:
-        import numpy as np
-
-        num_trials = int(max(2 * (num_preds * 2) * np.log2(num_candidates), 1.5 * num_candidates))
+        num_trials = int(max(2 * (num_preds * 2) * math.log2(num_candidates), 1.5 * num_candidates))
         if num_trials < 0 or valset_size < 0 or minibatch_size < 0:
             raise ValueError("num_trials, valset_size, and minibatch_size must be >= 0.")
         if full_eval_steps < 1:

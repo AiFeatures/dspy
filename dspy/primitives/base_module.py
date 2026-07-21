@@ -159,12 +159,15 @@ class BaseModule:
     def load_state(self, state, *, allow_unsafe_lm_state=False):
         from dspy.predict.predict import Predict
 
-        for name, param in self.named_parameters():
-            if isinstance(param, Predict):
-                param.load_state(state[name], allow_unsafe_lm_state=allow_unsafe_lm_state)
-            else:
-                param.load_state(state[name])
+        def _apply(module):
+            for name, param in module.named_parameters():
+                if isinstance(param, Predict):
+                    param.load_state(state[name], allow_unsafe_lm_state=allow_unsafe_lm_state)
+                else:
+                    param.load_state(state[name])
 
+        _apply(self.deepcopy())  # trial run raises before self is touched
+        _apply(self)
     def save(self, path, save_program=False, modules_to_serialize=None):
         """Save the module.
 
@@ -257,7 +260,8 @@ class BaseModule:
             allow_pickle (bool): If True, allow loading .pkl files, which can run arbitrary code.
                 This is dangerous and should only be used if you are sure about the source of the file and in a trusted environment.
             allow_unsafe_lm_state (bool): If True, preserves unsafe LM endpoint keys (e.g.,
-                `api_base`, `base_url`, and `model_list`) from loaded state. Enable only for trusted files.
+                `api_base`, `base_url`, and `model_list`) from loaded state and allows importing custom LM classes.
+                Enable only for trusted files.
         """
         path = Path(path)
 
