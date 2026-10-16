@@ -39,7 +39,7 @@ def test_tool_observation_preserves_custom_type():
                 "next_tool_name": "finish",
                 "next_tool_args": {},
             },
-            {"reasoning": "image ready", "answer": "done"},
+            {"plan": "image ready", "answer": "done"},
         ],
         adapter=adapter,
     )
@@ -96,7 +96,7 @@ def test_tool_calling_with_pydantic_args():
                 "next_tool_args": {},
             },
             {
-                "reasoning": "This is a very rigorous reasoning process, trust me bro!",
+                "plan": "This is a very rigorous reasoning process, trust me bro!",
                 "invitation_letter": "It's my honor to invite Alice to the Science Fair event on Friday.",
             },
         ]
@@ -165,7 +165,7 @@ def test_react_with_tools_skips_native_response_issubclass_for_generic_alias(mon
                 "next_tool_args": {},
             },
             {
-                "reasoning": "I fetched the user profile and can answer the request.",
+                "plan": "I fetched the user profile and can answer the request.",
                 "process_result": "Resolved Adam's request.",
             },
         ]
@@ -189,7 +189,7 @@ def test_tool_calling_without_typehint():
         [
             {"next_thought": "I need to add two numbers.", "next_tool_name": "foo", "next_tool_args": {"a": 1, "b": 2}},
             {"next_thought": "I have the sum, now I can finish.", "next_tool_name": "finish", "next_tool_args": {}},
-            {"reasoning": "I added the numbers successfully", "c": 3},
+            {"plan": "I added the numbers successfully", "c": 3},
         ]
     )
     dspy.configure(lm=lm)
@@ -250,6 +250,45 @@ def test_trajectory_truncation():
     assert "thought_0" not in result.trajectory
     assert "thought_2" in result.trajectory
     assert result.output_text == "Final output"
+
+
+def test_truncate_trajectory_raises_on_single_tool_call():
+    # A trajectory with exactly one tool call has 4 keys (thought, tool_name, tool_args,
+    # observation). Per truncate_trajectory's own docstring/error message, this is the
+    # smallest trajectory that cannot be truncated further, so it must raise instead of
+    # silently popping every key and returning an empty trajectory.
+    react = dspy.ReAct("input_text -> output_text", tools=[])
+    trajectory = {
+        "thought_0": "Thought 0",
+        "tool_name_0": "finish",
+        "tool_args_0": {},
+        "observation_0": "Completed.",
+    }
+
+    with pytest.raises(ContextWindowExceededError):
+        react.truncate_trajectory(trajectory)
+
+
+def test_truncation_exhausted_raises_context_window_exceeded_error():
+    def echo(text: str) -> str:
+        return f"Echoed: {text}"
+
+    react = dspy.ReAct("input_text -> output_text", tools=[echo])
+
+    def always_exceed(**kwargs):
+        raise ContextWindowExceededError()
+
+    trajectory = {}
+    for i in range(4):
+        trajectory[f"thought_{i}"] = f"Thought {i}"
+        trajectory[f"tool_name_{i}"] = "echo"
+        trajectory[f"tool_args_{i}"] = {"text": f"Text {i}"}
+        trajectory[f"observation_{i}"] = f"Echoed: Text {i}"
+
+    with pytest.raises(ContextWindowExceededError, match="even after 3 attempts") as exc_info:
+        react._call_with_potential_trajectory_truncation(always_exceed, trajectory, input_text="test input")
+
+    assert isinstance(exc_info.value.__cause__, ContextWindowExceededError)
 
 
 @pytest.mark.asyncio
@@ -320,7 +359,7 @@ def test_error_retry():
                 "next_tool_args": {"a": 1, "b": 2},
             },
             # (The model *would* succeed on the 3rd turn, but max_iters=2 stops earlier.)
-            {"reasoning": "I added the numbers successfully", "c": 3},
+            {"plan": "I added the numbers successfully", "c": 3},
         ]
     )
     dspy.configure(lm=lm)
@@ -346,6 +385,30 @@ def test_error_retry():
     for i in range(2):
         obs = traj[f"observation_{i}"]
         assert re.search(r"\btool error\b", obs), f"unexpected observation_{i!r}: {obs}"
+
+
+def test_tool_error_observation_format():
+    def failing_tool():
+        raise ValueError("tool blew up")
+
+    react = dspy.ReAct("question -> answer", tools=[failing_tool])
+    lm = DummyLM(
+        [
+            {
+                "next_thought": "I will call the tool.",
+                "next_tool_name": "failing_tool",
+                "next_tool_args": {},
+            },
+            {"plan": "The tool failed.", "answer": "n/a"},
+        ]
+    )
+    dspy.configure(lm=lm)
+
+    outputs = react(question="What happens?", max_iters=1)
+    obs = outputs.trajectory["observation_0"]
+
+    assert obs.startswith("Execution error in failing_tool: \nTraceback (most recent call last):")
+    assert obs.endswith("ValueError: tool blew up")
 
 
 @pytest.mark.asyncio
@@ -390,7 +453,7 @@ async def test_async_tool_calling_with_pydantic_args():
                 "next_tool_args": {},
             },
             {
-                "reasoning": "This is a very rigorous reasoning process, trust me bro!",
+                "plan": "This is a very rigorous reasoning process, trust me bro!",
                 "invitation_letter": "It's my honor to invite Alice to the Science Fair event on Friday.",
             },
         ]
@@ -446,7 +509,7 @@ async def test_async_error_retry():
                 "next_tool_args": {"a": 1, "b": 2},
             },
             # (The model *would* succeed on the 3rd turn, but max_iters=2 stops earlier.)
-            {"reasoning": "I added the numbers successfully", "c": 3},
+            {"plan": "I added the numbers successfully", "c": 3},
         ]
     )
     with dspy.context(lm=lm):
